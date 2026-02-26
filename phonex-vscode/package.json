@@ -1,0 +1,54 @@
+{
+  "name": "phonex",
+  "displayName": "phonex - AI Assistant",
+  "description": "AI-powered code assistant for the .NET codebase",
+  "version": "1.0.3",
+  "publisher": "cdp-team",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/phonex"
+  },
+  "engines": { "vscode": "^1.93.0" },
+  "categories": ["AI", "Chat"],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "chatParticipants": [
+      {
+        "id": "phonex.chat",
+        "fullName": "phonex",
+        "name": "phonex",
+        "description": "Ask questions about the .NET codebase",
+        "isSticky": true,
+        "commands": [
+          {
+            "name": "flow",
+            "description": "Explain a request flow or data pipeline"
+          },
+          {
+            "name": "pattern",
+            "description": "Show a code pattern or best practice"
+          },
+          {
+            "name": "package",
+            "description": "Get info about a specific NuGet package"
+          },
+          {
+            "name": "reset",
+            "description": "Clear conversation memory and start fresh"
+          }
+        ]
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.93.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.5.0"
+  }
+}
