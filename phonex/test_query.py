@@ -6,14 +6,12 @@ Optimized for i7-1270P / 32GB RAM / Intel Xe GPU (no dedicated NVIDIA card).
 """
 
 import time
+import os
 import chromadb
 from llama_index.core import VectorStoreIndex, Settings
 from llama_index.vector_stores.chroma import ChromaVectorStore
-from llama_index.embeddings.ollama import OllamaEmbedding
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.llms.ollama import Ollama
-# FIX: Import SIMPLE_SUMMARIZE to prevent the default refine synthesizer
-# from making multiple LLM calls — same fix as server.py.
-from llama_index.core.response_synthesizers import get_response_synthesizer, ResponseMode
 
 
 # ──────────────────────────────────────────────
@@ -27,50 +25,22 @@ OLLAMA_BASE_URL = "http://localhost:11434"
 # Run: ollama pull qwen2.5-coder:7b-instruct-q4_K_M
 LLM_MODEL = "qwen2.5-coder:7b-instruct-q4_K_M"
 
-EMBED_MODEL = "nomic-embed-text"
-INDEX_PATH = r"D:\Gitrnd\phonex"
+EMBED_MODEL = "all-MiniLM-L6-v2"
+COLLECTION_NAME = "asp_netcore"
+INDEX_PATH = r"D:\Gitrnd\phonex\indexfolder\phonex_index_download"
 
 
 # ──────────────────────────────────────────────
 # Configure models
 # ──────────────────────────────────────────────
-Settings.embed_model = OllamaEmbedding(
-    model_name=EMBED_MODEL,
-    base_url=OLLAMA_BASE_URL,
-)
+Settings.embed_model = HuggingFaceEmbedding(model_name=EMBED_MODEL)
 
 Settings.llm = Ollama(
     model=LLM_MODEL,
     base_url=OLLAMA_BASE_URL,
-
-    # OLD: request_timeout=600  (10 minutes — way too long for a test script)
-    # FIX: 60 seconds. With all optimizations below, 7B on your i7-1270P should
-    # respond in 10-30 sec. If it hits 60, something else is wrong (model not loaded,
-    # Ollama not running, etc.) and you want to know fast — not wait 10 minutes.
     request_timeout=60,
-
-    # FIX: keep_alive keeps the model hot in RAM between test runs.
-    # Without this, Ollama unloads the model after each call and reloads it
-    # for the next one — adding 5-10 sec of dead time per query.
     keep_alive="10m",
-
-    # FIX: num_ctx controls the context window sent to the model.
-    # Default is 2048-4096. We cap it at 2048 for the test script because:
-    # - test_query only retrieves 2 chunks (similarity_top_k=2)
-    # - smaller context = faster prefill = faster first token
-    num_ctx=2048,
-
-    # FIX: num_thread pins Ollama to your i7-1270P's P-cores.
-    # Your CPU has 4 P-cores + 8 E-cores = 16 threads total.
-    # Using 12 threads: leaves 4 for Windows/VS Code, avoids E-core scheduling overhead.
-    # Intel hybrid CPUs (like yours) are slower when LLM threads land on E-cores.
-    num_thread=12,
-
-    # FIX: num_gpu=1 tells Ollama to use your Intel Xe integrated GPU for some layers.
-    # Combined with OLLAMA_GPU_LAYERS env var (set in start.cmd), this offloads
-    # the attention layers to iGPU, freeing CPU for feed-forward layers.
-    # Net result: ~20-30% faster on Intel Xe vs CPU-only.
-    num_gpu=1,
+    additional_kwargs={"num_ctx": 2048, "num_thread": 12, "num_gpu": 1},
 )
 
 
@@ -78,8 +48,11 @@ Settings.llm = Ollama(
 # Load the existing index
 # ──────────────────────────────────────────────
 print(f"Loading index from {INDEX_PATH}...")
-chroma_client = chromadb.PersistentClient(path=INDEX_PATH)
-chroma_collection = chroma_client.get_collection("cdpdevops")
+chroma_client = chromadb.PersistentClient(
+    path=INDEX_PATH,
+    settings=chromadb.Settings(anonymized_telemetry=False),
+)
+chroma_collection = chroma_client.get_collection(COLLECTION_NAME)
 vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
 index = VectorStoreIndex.from_vector_store(vector_store)
 
@@ -88,24 +61,8 @@ index = VectorStoreIndex.from_vector_store(vector_store)
 # Build query engine with speed optimizations
 # ──────────────────────────────────────────────
 
-# FIX: Explicit SIMPLE_SUMMARIZE synthesizer.
-# OLD (implicit): ResponseMode.COMPACT_AND_REFINE
-# REASON: COMPACT_AND_REFINE calls the LLM once per retrieved chunk to refine
-# the answer iteratively. With similarity_top_k=2 that's 2 LLM calls.
-# SIMPLE_SUMMARIZE concatenates all chunks and calls the LLM exactly ONCE.
-synthesizer = get_response_synthesizer(
-    response_mode=ResponseMode.SIMPLE_SUMMARIZE,
-)
-
-engine = index.as_query_engine(
-    # OLD: similarity_top_k=2  ← already good, keeping it
-    # This controls how many chunks are retrieved from ChromaDB.
-    # 2 is the right number for a test script — enough context, minimal LLM load.
-    similarity_top_k=2,
-
-    # FIX: Pass our fast synthesizer so LlamaIndex doesn't silently use refine.
-    response_synthesizer=synthesizer,
-)
+# Use retriever directly so we can stream tokens from the LLM live.
+retriever = index.as_retriever(similarity_top_k=2)
 
 
 # ──────────────────────────────────────────────
@@ -114,22 +71,35 @@ engine = index.as_query_engine(
 QUERY = "What is the language of the code?"
 
 print(f"\nQuery: {QUERY}")
-print("─" * 50)
+print("-" * 50)
+
+# Step 1: Retrieve relevant chunks
+print("[Retrieving context...]")
+retrieve_start = time.time()
+nodes = retriever.retrieve(QUERY)
+context = "\n\n---\n\n".join(n.text for n in nodes)
+print(f"[Retrieved {len(nodes)} chunks in {time.time()-retrieve_start:.1f}s]\n")
+
+# Step 2: Build prompt and stream tokens live
+prompt = f"Here is relevant code from the codebase:\n\n{context}\n\n---\n\nQuestion: {QUERY}"
 
 start = time.time()
-response = engine.query(QUERY)
-elapsed = time.time() - start
+full_text = []
+for chunk in Settings.llm.stream_complete(prompt):
+    token = chunk.delta
+    print(token, end="", flush=True)
+    full_text.append(token)
 
-print(response)
-print("─" * 50)
+elapsed = time.time() - start
+print("\n" + "-" * 50)
 print(f"Response time: {elapsed:.1f} seconds")
 
 # Give feedback on whether the speed is on target
 if elapsed < 15:
-    print("✅ Speed: EXCELLENT (under 15 sec)")
+    print("[OK] Speed: EXCELLENT (under 15 sec)")
 elif elapsed < 30:
-    print("✅ Speed: GOOD (under 30 sec)")
+    print("[OK] Speed: GOOD (under 30 sec)")
 elif elapsed < 60:
-    print("⚠️  Speed: ACCEPTABLE — check OLLAMA_NUM_THREAD and OLLAMA_GPU_LAYERS env vars")
+    print("[WARN] Speed: ACCEPTABLE -- check OLLAMA_NUM_THREAD and OLLAMA_GPU_LAYERS env vars")
 else:
-    print("❌ Speed: TOO SLOW — model may not be loaded, or num_thread/num_gpu not set")
+    print("[SLOW] Speed: TOO SLOW -- model may not be loaded, or num_thread/num_gpu not set")

@@ -41,6 +41,7 @@ import os
 os.environ["ANONYMIZED_TELEMETRY"] = "False"
 
 import json
+import time
 import asyncio
 import httpx
 from fastapi import FastAPI
@@ -51,7 +52,7 @@ from llama_index.core import VectorStoreIndex, Settings
 from llama_index.core.memory import ChatMemoryBuffer
 from llama_index.core.response_synthesizers import get_response_synthesizer, ResponseMode
 from llama_index.vector_stores.chroma import ChromaVectorStore
-from llama_index.embeddings.ollama import OllamaEmbedding
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.llms.ollama import Ollama
 
 
@@ -59,9 +60,10 @@ from llama_index.llms.ollama import Ollama
 # CONFIGURATION
 # ──────────────────────────────────────────────
 OLLAMA_BASE_URL = "http://localhost:11434"
-EMBEDDING_MODEL = "nomic-embed-text"
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 LLM_MODEL       = "qwen2.5-coder:7b-instruct-q4_K_M"
-INDEX_PATH      = r"D:\Gitrnd\phonex"
+INDEX_PATH      = r"D:\Gitrnd\phonex\indexfolder\phonex_index_download"
+COLLECTION_NAME = "asp_netcore"
 TOP_K           = 2
 SERVER_PORT     = 8321
 
@@ -94,9 +96,8 @@ Key architectural patterns:
 # ──────────────────────────────────────────────
 print("Initializing phonex RAG server...")
 
-Settings.embed_model = OllamaEmbedding(
+Settings.embed_model = HuggingFaceEmbedding(
     model_name=EMBEDDING_MODEL,
-    base_url=OLLAMA_BASE_URL,
 )
 Settings.llm = Ollama(
     model=LLM_MODEL,
@@ -107,8 +108,11 @@ Settings.llm = Ollama(
     system_prompt=SYSTEM_PROMPT,
 )
 
-chroma_client     = chromadb.PersistentClient(path=INDEX_PATH)
-chroma_collection = chroma_client.get_collection("cdpdevops")
+chroma_client     = chromadb.PersistentClient(
+    path=INDEX_PATH,
+    settings=chromadb.Settings(anonymized_telemetry=False),
+)
+chroma_collection = chroma_client.get_collection(COLLECTION_NAME)
 vector_store      = ChromaVectorStore(chroma_collection=chroma_collection)
 index             = VectorStoreIndex.from_vector_store(vector_store)
 
@@ -127,7 +131,38 @@ chat_engine._get_response_synthesizer = lambda *args, **kwargs: simple_synthesiz
 
 print("   Synthesizer : SIMPLE_SUMMARIZE ✅")
 print(f"✅ RAG server ready → http://localhost:{SERVER_PORT}")
-print(f"   Model: {LLM_MODEL} | TOP_K: {TOP_K}")
+print(f"   Model:      {LLM_MODEL} | TOP_K: {TOP_K}")
+print(f"   Embeddings: {EMBEDDING_MODEL}")
+print(f"   Index:      {INDEX_PATH}  (collection: {COLLECTION_NAME})")
+
+
+# ──────────────────────────────────────────────
+# Pre-warm Ollama on startup (eliminates cold-start delay for first query)
+# ──────────────────────────────────────────────
+def _prewarm_ollama() -> None:
+    """Send a tiny synchronous request to load the model into memory."""
+    import httpx as _httpx
+    try:
+        print(f"Pre-warming {LLM_MODEL}...")
+        r = _httpx.post(
+            f"{OLLAMA_BASE_URL}/api/chat",
+            json={
+                "model": LLM_MODEL,
+                "stream": False,
+                "keep_alive": "10m",
+                "options": {"num_ctx": 64, "num_thread": 12, "num_gpu": 1},
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            timeout=60.0,
+        )
+        if r.status_code == 200:
+            print(f"   {LLM_MODEL} is hot and ready.")
+        else:
+            print(f"   Pre-warm got HTTP {r.status_code} — model will load on first query.")
+    except Exception as e:
+        print(f"   Pre-warm skipped ({e}) — Ollama may not be running yet.")
+
+
 
 
 # ──────────────────────────────────────────────
@@ -162,6 +197,7 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     answer: str
     sources: list[dict]
+    total_time_s: float = 0.0
 
 
 @app.get("/health")
@@ -179,7 +215,10 @@ async def chat(request: ChatRequest):
     """Blocking endpoint for PowerShell testing."""
     if request.reset_memory:
         chat_engine.reset()
+    t_start = time.perf_counter()
     response = await asyncio.to_thread(chat_engine.chat, request.message)
+    total_time = time.perf_counter() - t_start
+    print(f"[/chat] Total response time: {total_time:.2f}s")
     sources = []
     for node in response.source_nodes:
         sources.append({
@@ -187,7 +226,7 @@ async def chat(request: ChatRequest):
             "score":   round(node.score, 3) if node.score else None,
             "preview": node.text[:200] if node.text else "",
         })
-    return ChatResponse(answer=str(response), sources=sources[:TOP_K])
+    return ChatResponse(answer=str(response), sources=sources[:TOP_K], total_time_s=round(total_time, 2))
 
 
 @app.post("/chat/stream")
@@ -213,6 +252,8 @@ async def chat_stream(request: ChatRequest):
     queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_event_loop()
 
+    t_start = time.perf_counter()
+
     async def generate():
         try:
             # ── CRITICAL FIX: send real JSON data event immediately ──────
@@ -236,6 +277,12 @@ async def chat_stream(request: ChatRequest):
                         # Sentinel — background task is done
                         break
 
+                    # Attach total_time_s to the final done event
+                    if isinstance(item, dict) and item.get("done"):
+                        total_time = time.perf_counter() - t_start
+                        item["total_time_s"] = round(total_time, 2)
+                        print(f"[/chat/stream] Total response time: {total_time:.2f}s")
+
                     # Item is either a token dict or a sources/error dict
                     yield f"data: {json.dumps(item)}\n\n"
 
@@ -250,6 +297,8 @@ async def chat_stream(request: ChatRequest):
             await background
 
         except Exception as e:
+            total_time = time.perf_counter() - t_start
+            print(f"[/chat/stream] Error after {total_time:.2f}s: {e}")
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
@@ -332,5 +381,6 @@ def reset_memory():
 
 
 if __name__ == "__main__":
+    _prewarm_ollama()
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=SERVER_PORT)

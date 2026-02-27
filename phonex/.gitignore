@@ -1,0 +1,14 @@
+# Virtual environment
+.venv/
+
+# Data and index folders
+data/
+indexfolder/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# VS Code
+.vscode/
